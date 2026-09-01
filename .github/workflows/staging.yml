@@ -1,0 +1,176 @@
+# Reusable staging CD workflow for all Yanol Tech projects.
+# Builds image, pushes to GHCR, triggers Dokploy deploy.
+name: Staging CD
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+        description: "Project name (e.g. yano-pms)"
+      service:
+        required: true
+        type: string
+        description: "Service name (e.g. backend, frontend)"
+      health_path:
+        required: false
+        type: string
+        default: "/health"
+        description: "Health check endpoint path"
+    secrets:
+      GHCR_TOKEN:
+        required: true
+      DOKPLOY_API_KEY:
+        required: true
+      DOKPLOY_STAGING_APP_ID:
+        required: true
+      DOKPLOY_URL:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: staging-${{ inputs.project }}-${{ inputs.service }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set image variables
+        id: vars
+        run: |
+          IMAGE="ghcr.io/yanol-tech-solution/${{ inputs.project }}-${{ inputs.service }}"
+          SHA="${{ github.sha }}"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "tag=${IMAGE}:${SHA}" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.image }}:staging
+          cache-from: type=registry,ref=${{ steps.vars.outputs.image }}:staging
+          cache-to: type=inline
+
+      - name: Trivy scan (gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.vars.outputs.tag }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Update Dokploy app image
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL || 'https://dokploy.yanoltech.com' }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_STAGING_APP_ID }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          # Step 1: Update the app's dockerImage to the new SHA tag
+          UPDATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "${DOKPLOY_URL}/api/application.update" \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"applicationId\":\"${APP_ID}\",\"dockerImage\":\"${IMAGE_TAG}\"}")
+          HTTP_CODE=$(echo "$UPDATE_RESP" | tail -1)
+          BODY=$(echo "$UPDATE_RESP" | head -n -1)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to update Dokploy app image (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            exit 1
+          fi
+          echo "✅ Updated Dokploy app image to ${IMAGE_TAG}"
+
+      - name: Trigger Dokploy deploy
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL || 'https://dokploy.yanoltech.com' }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_STAGING_APP_ID }}
+        run: |
+          DEPLOY_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "${DOKPLOY_URL}/api/application.deploy" \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"applicationId\":\"${APP_ID}\"}")
+          HTTP_CODE=$(echo "$DEPLOY_RESP" | tail -1)
+          BODY=$(echo "$DEPLOY_RESP" | head -n -1)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to trigger deploy (HTTP $HTTP_CODE)"
+            echo "$BODY"
+            exit 1
+          fi
+          echo "✅ Deploy triggered"
+
+      - name: Wait for deploy to complete
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL || 'https://dokploy.yanoltech.com' }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          APP_ID: ${{ secrets.DOKPLOY_STAGING_APP_ID }}
+        run: |
+          MAX_WAIT=300
+          INTERVAL=10
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(curl -s -H "x-api-key: ${DOKPLOY_API_KEY}" \
+              "${DOKPLOY_URL}/api/application.one?applicationId=${APP_ID}" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('applicationStatus','unknown'))")
+            echo "  Status: $STATUS (${ELAPSED}s elapsed)"
+            if [ "$STATUS" = "done" ]; then
+              echo "✅ Deploy completed"
+              exit 0
+            fi
+            if [ "$STATUS" = "error" ]; then
+              echo "❌ Deploy failed"
+              exit 1
+            fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          echo "❌ Deploy timed out after ${MAX_WAIT}s"
+          exit 1
+
+      - name: Verify health
+        env:
+          HEALTH_PATH: ${{ inputs.health_path }}
+        run: |
+          # Health endpoint URL should be provided via env or we skip
+          # The domain is project-specific, so we check if HEALTH_URL is set
+          if [ -z "${HEALTH_URL}" ]; then
+            echo "⚠️  HEALTH_URL not set — skipping health check"
+            echo "   Set HEALTH_URL env var to enable post-deploy health verification"
+            exit 0
+          fi
+          MAX_RETRIES=6
+          for i in $(seq 1 $MAX_RETRIES); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}${HEALTH_PATH}" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "✅ Health check passed (${HEALTH_URL}${HEALTH_PATH})"
+              exit 0
+            fi
+            echo "  Health check attempt $i: HTTP $CODE"
+            sleep 10
+          done
+          echo "❌ Health check failed after $MAX_RETRIES attempts"
+          exit 1

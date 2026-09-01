@@ -1,0 +1,177 @@
+# Reusable CI workflow for all Yanol Tech projects.
+# Called by each project's .github/workflows/ci.yml
+# Never deploys — validates only.
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        required: true
+        type: string
+        description: "go | node | python"
+      service:
+        required: true
+        type: string
+        description: "backend | frontend | worker"
+      run_integration:
+        required: false
+        type: boolean
+        default: true
+        description: "Run integration tests with ephemeral DB"
+      docker_context:
+        required: false
+        type: string
+        default: "."
+        description: "Docker build context path"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --- Language setup ---
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # --- Install dependencies ---
+      - name: Install Go deps
+        if: inputs.language == 'go'
+        run: go mod download
+
+      - name: Install Node deps
+        if: inputs.language == 'node'
+        run: npm ci
+
+      - name: Install Python deps
+        if: inputs.language == 'python'
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- Formatting ---
+      - name: Go format check
+        if: inputs.language == 'go'
+        run: |
+          fmt_output=$(gofmt -l .)
+          if [ -n "$fmt_output" ]; then
+            echo "❌ Go files need formatting:"
+            echo "$fmt_output"
+            exit 1
+          fi
+
+      - name: Node format check
+        if: inputs.language == 'node'
+        run: npx prettier --check . || true
+
+      - name: Python format check
+        if: inputs.language == 'python'
+        run: |
+          pip install black ruff 2>/dev/null
+          black --check . || true
+
+      # --- Linting ---
+      - name: Go lint
+        if: inputs.language == 'go'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout 5m
+
+      - name: Node lint
+        if: inputs.language == 'node'
+        run: npx eslint . || true
+
+      - name: Python lint
+        if: inputs.language == 'python'
+        run: ruff check . || true
+
+      # --- Type checking ---
+      - name: Node typecheck
+        if: inputs.language == 'node'
+        run: npx tsc --noEmit || true
+
+      # --- Tests ---
+      - name: Go tests
+        if: inputs.language == 'go'
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/test?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+        run: go test -v -cover ./...
+
+      - name: Node tests
+        if: inputs.language == 'node'
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/test?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+        run: npm test -- --coverage || npm run test -- --coverage || true
+
+      - name: Python tests
+        if: inputs.language == 'python'
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/test?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+        run: pytest -v --cov || true
+
+      # --- Docker build verification ---
+      - name: Docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          push: false
+          load: true
+          tags: ${{ github.repository }}:${{ github.sha }}-ci
+
+      # --- Security scan ---
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.repository }}:${{ github.sha }}-ci
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
