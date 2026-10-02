@@ -1,0 +1,27 @@
+# Local-only secrets — never commit
+credentials.md
+*.env
+.env.*
+toolkit/state/
+
+# Real credentials hardcoded in this compose — local only
+yanet-compose.yml
+
+# Self-hosted Infisical compose contains ENCRYPTION_KEY — local only
+infisical-compose.yml
+
+# Backups contain client data — local only
+backup/
+*.sql
+*.sql.gz
+*.dump
+*.tar.gz
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.log
+*.tmp
